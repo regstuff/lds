@@ -384,7 +384,7 @@
                     }
 
                     // 4. Chunking & Tagging
-                    const chunks = chunkText(rawText, 300); // 300 words per chunk
+                    const chunks = chunkText(rawText, 350); // 350 words per chunk
                     let taggedFullText = ""; // We rebuild the full text with hidden tags
                     const chunkMap = {};
                     const docsToInsert = [];
@@ -734,19 +734,61 @@
             });
         }
         
-        // Simple word-count based chunker. Could be improved with sentence boundaries.
         function chunkText(text, maxWords) {
-            const paragraphs = text.split(/\n\s*\n/); const chunks = [];
-            let currentChunk = []; let currentWordCount = 0;
-            for (const para of paragraphs) {
-                const cleanPara = para.trim(); if(!cleanPara) continue;
-                const wordCount = cleanPara.split(/\s+/).length;
-                if (currentWordCount + wordCount > maxWords && currentChunk.length > 0) {
-                    chunks.push(currentChunk.join("\n\n")); currentChunk = []; currentWordCount = 0;
+            const paragraphs = text.split('\n'); // Split by single newline
+            const chunks = [];
+            let currentChunk = [];
+            let currentWordCount = 0;
+
+            for (let i = 0; i < paragraphs.length; i++) {
+                const para = paragraphs[i].trim();
+                if (!para) continue;
+
+                const paraWordCount = para.split(/\s+/).length;
+
+                // Check if paragraph is greater than maxWords (350)
+                if (paraWordCount > maxWords) {
+                    // Flush accumulated chunk if exists
+                    if (currentChunk.length > 0) {
+                        chunks.push(currentChunk.join("\n"));
+                        currentChunk = [];
+                        currentWordCount = 0;
+                    }
+
+                    // Split para by sentences (Fullstop, Exclamation, Question mark)
+                    const sentences = para.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g) || [para];
+                    
+                    let subChunk = [];
+                    let subChunkCount = 0;
+
+                    for (const sentence of sentences) {
+                        const sClean = sentence.trim();
+                        if (!sClean) continue;
+                        const sCount = sClean.split(/\s+/).length;
+
+                        // Chunk size as close but less than maxWords
+                        if (subChunkCount + sCount > maxWords && subChunk.length > 0) {
+                            chunks.push(subChunk.join(" "));
+                            subChunk = [];
+                            subChunkCount = 0;
+                        }
+                        subChunk.push(sClean);
+                        subChunkCount += sCount;
+                    }
+                    if (subChunk.length > 0) chunks.push(subChunk.join(" "));
+
+                } else {
+                    // Standard logic
+                    if (currentWordCount + paraWordCount > maxWords && currentChunk.length > 0) {
+                        chunks.push(currentChunk.join("\n"));
+                        currentChunk = [];
+                        currentWordCount = 0;
+                    }
+                    currentChunk.push(para);
+                    currentWordCount += paraWordCount;
                 }
-                currentChunk.push(cleanPara); currentWordCount += wordCount;
             }
-            if (currentChunk.length > 0) chunks.push(currentChunk.join("\n\n"));
+            if (currentChunk.length > 0) chunks.push(currentChunk.join("\n"));
             return chunks;
         }
         
