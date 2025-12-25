@@ -1,0 +1,785 @@
+<!-- 
+===================================================================================================
+  PROJECT: LOCAL DOC SEARCH (Serverless RAG)
+  
+  DESCRIPTION:
+  A completely client-side (browser-based) Semantic Search engine. It allows users to upload 
+  local documents (.docx, .txt), indexes them using AI embeddings directly in the browser, 
+  and allows for semantic searching (searching by meaning, not just keywords).
+  
+  HOW IT WORKS:
+  1. Ingestion: 
+     - Files are parsed (Mammoth.js for Word docs).
+     - Text is split into "chunks" (segments of ~300 words).
+     - Each chunk is "tagged" with a unique ID inside the full text string.
+  
+  2. Vectorization (AI):
+     - Transformers.js downloads a small LLM (all-MiniLM-L6-v2) to the browser.
+     - Each text chunk is converted into a 384-dimensional vector (embedding).
+  
+  3. Storage:
+     - Vectors are stored in 'Orama' (an in-memory vector database).
+     - Full text and metadata are stored in a JavaScript object (`fullTextsStore`).
+     - Persistence is handled by IndexedDB, saving the app state between reloads.
+  
+  4. Retrieval:
+     - User query is converted to a vector.
+     - Orama finds the mathematically closest text chunks.
+     - Results are displayed. Clicking a result parses the tagged full text 
+       to scroll exactly to the relevant section.
+
+  CORE COMPONENTS:
+  - UI: HTML5, CSS3, jQuery.
+  - Parsing: Mammoth.js (.docx support).
+  - Vector DB: Orama (Edge-optimized search).
+  - AI Model: Transformers.js (HuggingFace for the web).
+  - Security: Web Crypto API (AES-GCM) for encrypting exported backups.
+===================================================================================================
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Local Doc Search</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- LIBRARIES -->
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script> <!-- DOM Manipulation -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"> <!-- Icons -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script> <!-- DOCX Parser -->
+
+    <style>
+        /* CSS VARIABLES: Theme management */
+        :root {
+            --bg-color: #1a1a1a; --card-bg: #2d2d2d; --text-main: #e0e0e0; --text-muted: #a0a0a0;
+            --accent: #4a90e2; --accent-hover: #357abd; --danger: #e74c3c; --border: #444;
+            --highlight: rgba(255, 215, 0, 0.25); /* Gold highlight for active chunk in viewer */
+        }
+        
+        /* BASIC LAYOUT */
+        body { font-family: 'Segoe UI', sans-serif; background-color: var(--bg-color); color: var(--text-main); margin: 0; padding: 20px; }
+        .main-wrapper { display: flex; gap: 20px; width: 100%; justify-content: center; }
+        
+        /* MAIN COLUMN: Shrinks when viewer is open */
+        .content-column { max-width: 800px; width: 100%; transition: width 0.3s ease-in-out; }
+        
+        /* HEADER */
+        .header-bar { width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 15px; border-bottom: 1px solid var(--border); }
+        .title-group { display: flex; align-items: center; gap: 15px; }
+        h1 { margin: 0; font-size: 1.2rem; color: var(--text-muted); font-weight: 400; letter-spacing: 1px;}
+        
+        /* Interactive Icons */
+        #btn-reset-index { font-size: 1rem; cursor: pointer; color: var(--text-muted); opacity: 0.5; transition: 0.2s; }
+        #btn-reset-index:hover { color: var(--danger); opacity: 1; transform: rotate(180deg); }
+        
+        .icon-controls i { font-size: 1.2rem; margin-left: 20px; cursor: pointer; color: var(--text-muted); transition: color 0.2s; }
+        .icon-controls i:hover { color: var(--accent); }
+        
+        /* PANELS: Upload, Export, Import (Hidden by default) */
+        .admin-panel { display: none; background: var(--card-bg); padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid var(--border); }
+        .panel-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
+        
+        /* Drag & Drop Zone */
+        .drop-zone { border: 2px dashed var(--border); padding: 30px; text-align: center; color: var(--text-muted); border-radius: 5px; cursor: pointer; transition: 0.2s; }
+        .drop-zone:hover { border-color: var(--accent); color: var(--text-main); background: rgba(74, 144, 226, 0.05); }
+        
+        /* FORM ELEMENTS */
+        input[type="text"], input[type="password"] { background: #111; border: 1px solid var(--border); color: var(--text-main); padding: 10px 15px; border-radius: 6px; font-size: 0.95rem; width: 100%; }
+        input:focus { outline: none; border-color: var(--accent); }
+        button { background: var(--accent); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 0.95rem; transition: background 0.2s; }
+        button:hover { background: var(--accent-hover); }
+        
+        /* BUTTON VARIANTS */
+        .btn-link { background: none; border: 1px solid var(--accent); color: var(--accent); }
+        .btn-link:hover { background: var(--accent); color: white; }
+        .btn-danger-icon { background: none; border: 1px solid var(--border); color: var(--danger); }
+        .btn-danger-icon:hover { background: var(--danger); color: white; border-color: var(--danger); }
+        
+        /* SEARCH RESULTS */
+        .search-container { width: 100%; display: flex; gap: 10px; margin-bottom: 30px; }
+        .result-item { background: var(--card-bg); padding: 20px; margin-bottom: 15px; border-radius: 8px; border-left: 4px solid var(--accent); }
+        .result-title { font-weight: bold; color: var(--accent); margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.5px; }
+        .result-text { line-height: 1.6; font-size: 0.95rem; white-space: pre-wrap; color: #ccc; }
+        .result-actions { margin-top: 15px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #333; padding-top: 10px; }
+        
+        /* SIDE VIEWER PANE (Hidden initially) */
+        #viewer-pane { display: none; width: 0; min-width: 0; background: #151515; border-left: 1px solid var(--border); padding: 20px; overflow-y: auto; position: sticky; top: 20px; height: calc(100vh - 40px); box-shadow: -5px 0 15px rgba(0,0,0,0.5); }
+        #viewer-pane.visible { width: 50%; min-width: 400px; } /* Slides out to take 50% width */
+        
+        .viewer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+        .viewer-left-group { display: flex; align-items: center; gap: 15px; }
+        .viewer-title { font-weight: bold; color: var(--accent); font-size: 1.1rem; }
+        .viewer-controls button { background: none; border: none; color: var(--text-muted); font-size: 1.1rem; cursor: pointer; margin-left: 10px; padding: 5px; }
+        .viewer-controls button:hover { color: var(--text-main); }
+        
+        .viewer-content { white-space: pre-wrap; line-height: 1.7; color: #d0d0d0; font-family: 'Georgia', serif; }
+        
+        /* CHUNK HIGHLIGHTING IN VIEWER */
+        .searchable-chunk { transition: background-color 0.5s; }
+        .searchable-chunk.active-highlight { background-color: var(--highlight); border-radius: 4px; padding: 2px 0; border: 1px solid rgba(255, 215, 0, 0.4); }
+
+        /* FLOATING STATUS BAR */
+        #status-bar { position: fixed; bottom: 20px; right: 20px; background: var(--card-bg); padding: 10px 20px; border-radius: 20px; font-size: 0.8rem; box-shadow: 0 4px 10px rgba(0,0,0,0.3); border: 1px solid var(--border); display: none; z-index: 1000;}
+    </style>
+</head>
+<body>
+
+    <div class="main-wrapper">
+        <!-- LEFT COLUMN: Search & Results -->
+        <div class="content-column" id="main-content">
+            <div class="header-bar">
+                <div class="title-group">
+                    <h1 id="app-title">Local Doc Search</h1>
+                    <i class="fas fa-sync-alt" id="btn-reset-index" title="Remove Index (Reset)"></i>
+                </div>
+                <div class="icon-controls">
+                    <i class="fas fa-upload" id="btn-open-import" title="Import Index from Backup"></i>
+                    <i class="fas fa-save" id="btn-open-export" title="Save/Export Index"></i>
+                    <i class="fas fa-plus-circle" id="btn-open-upload" title="Add Documents"></i>
+                </div>
+            </div>
+
+            <!-- Upload Panel -->
+            <div id="panel-upload" class="admin-panel">
+                <h3 style="margin-top:0">Add Documents</h3>
+                <div id="zone-upload" class="drop-zone">
+                    <i class="fas fa-file-alt" style="font-size: 2rem; margin-bottom: 10px;"></i><br>
+                    Click to Select or Drag files<br>
+                    <small>(.docx and .txt supported)</small>
+                    <input type="file" id="file-input" accept=".docx, .txt" multiple style="display:none">
+                </div>
+                <div id="upload-log" style="margin-top:10px; font-size: 0.9rem; color: #888; max-height: 100px; overflow-y: auto;"></div>
+            </div>
+
+            <!-- Export Panel -->
+            <div id="panel-export" class="admin-panel">
+                <h3 style="margin-top:0">Save Index (Export)</h3>
+                <p style="font-size:0.8rem; color:var(--text-muted)">Enter a password to encrypt your data.</p>
+                <div class="panel-row">
+                    <input type="text" id="export-name" placeholder="Filename (e.g., project-alpha)">
+                    <input type="password" id="export-pass" placeholder="Encryption Password">
+                </div>
+                <button id="btn-do-export"><i class="fas fa-lock"></i> Encrypt & Save</button>
+            </div>
+
+            <!-- Import Panel -->
+            <div id="panel-import" class="admin-panel">
+                <h3 style="margin-top:0">Import Backup</h3>
+                <p style="font-size:0.8rem; color:var(--danger)">Warning: This replaces current data.</p>
+                <div class="panel-row">
+                    <input type="file" id="import-file" accept=".json">
+                </div>
+                <div class="panel-row">
+                    <input type="password" id="import-pass" placeholder="Decryption Password">
+                    <button id="btn-do-import"><i class="fas fa-unlock"></i> Decrypt & Import</button>
+                </div>
+            </div>
+            
+            <!-- Search Bar -->
+            <div class="search-container">
+                <input type="text" id="search-input" placeholder="Search your documents...">
+                <button id="search-btn"><i class="fas fa-search"></i></button>
+            </div>
+            
+            <!-- Result List -->
+            <div id="results"></div>
+        </div>
+
+        <!-- RIGHT COLUMN: Document Viewer -->
+        <div id="viewer-pane">
+            <div class="viewer-header">
+                <div class="viewer-left-group">
+                    <button id="btn-delete-file" class="btn-danger-icon" title="Delete File" style="border:1px solid #e74c3c; padding: 5px 10px; border-radius: 4px;">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                    <div id="viewer-title" class="viewer-title"></div>
+                </div>
+                <div class="viewer-controls">
+                    <button id="btn-copy-fulltext" title="Copy Full Text"><i class="fas fa-copy"></i></button>
+                    <button id="btn-close-viewer" title="Close"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div id="viewer-content" class="viewer-content"></div>
+        </div>
+    </div>
+
+    <div id="status-bar"><i class="fas fa-spinner fa-spin"></i> <span id="status-text">Loading...</span></div>
+
+    <!-- MODULE SCRIPT: Main Application Logic -->
+    <script type="module">
+        // Import Orama (Vector DB) and Transformers.js (AI Models) from CDN
+        import { create, insertMultiple, search, save, load, remove } from 'https://esm.sh/@orama/orama@latest';
+        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0/dist/transformers.min.js';
+
+        // Configuration for Transformers.js
+        // allowLocalModels: false ensures it fetches models from web/cache, not looking for local file paths
+        env.allowLocalModels = false; 
+        env.useBrowserCache = true;
+        
+        // Global State Variables
+        let db;              // The Orama database instance
+        let extractor;       // The AI embedding function
+        let fullTextsStore = {}; // Stores raw text mapped by filename: { "file1": { full: "...", chunks: {...} } }
+        let currentIndexName = "Local Doc Search"; 
+
+        // --- INDEXEDDB HELPER ---
+        // A wrapper to make IndexedDB easier to use with Async/Await
+        const DB_NAME = 'DocSearchDB';
+        const STORE_NAME = 'app_data';
+        
+        const idb = {
+            open: () => {
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open(DB_NAME, 1);
+                    req.onupgradeneeded = (e) => e.target.result.createObjectStore(STORE_NAME);
+                    req.onsuccess = (e) => resolve(e.target.result);
+                    req.onerror = (e) => reject(e);
+                });
+            },
+            put: async (key, value) => {
+                const db = await idb.open();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(STORE_NAME, 'readwrite');
+                    tx.oncomplete = resolve;
+                    tx.onerror = reject;
+                    tx.objectStore(STORE_NAME).put(value, key);
+                });
+            },
+            get: async (key) => {
+                const db = await idb.open();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(STORE_NAME, 'readonly');
+                    const req = tx.objectStore(STORE_NAME).get(key);
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = reject;
+                });
+            },
+            clear: async () => {
+                const db = await idb.open();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(STORE_NAME, 'readwrite');
+                    tx.oncomplete = resolve;
+                    tx.objectStore(STORE_NAME).clear();
+                });
+            }
+        };
+
+        // --- INITIALIZATION ---
+        $(document).ready(async function() {
+            showStatus("Initializing AI Model...", 0);
+            try {
+                // 1. Load the Feature Extraction model (MiniLM) - ~23MB download first time
+                extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+                
+                // 2. Initialize the Orama Vector Database Schema
+                // vector[384] matches the output dimension of MiniLM
+                db = await create({ schema: { id: 'string', title: 'string', chunkId: 'string', embedding: 'vector[384]' } });
+                
+                // 3. Load previous state from IndexedDB if it exists
+                await loadFromDatabase();
+                
+                $('#app-title').text(currentIndexName);
+                if(Object.keys(fullTextsStore).length > 0) {
+                    showStatus(`Loaded "${currentIndexName}" with ${Object.keys(fullTextsStore).length} files.`, 3000);
+                } else { showStatus("System Ready.", 2000); }
+            } catch (e) { console.error(e); showStatus("Init Error: " + e.message); }
+        });
+
+        // --- UI EVENT HANDLERS ---
+        
+        // Toggle specific admin panels
+        function togglePanel(panelId) { $('.admin-panel').not(panelId).slideUp(); $(panelId).slideToggle(); }
+        $('#btn-open-upload').click(() => togglePanel('#panel-upload'));
+        $('#btn-open-export').click(() => togglePanel('#panel-export'));
+        $('#btn-open-import').click(() => togglePanel('#panel-import'));
+        $('#btn-reset-index').click(resetIndex);
+
+        // Search Triggers
+        $('#search-btn').click(performSearch);
+        $('#search-input').on('keypress', (e) => { if(e.which === 13) performSearch(); });
+        
+        // File Input Triggers
+        $('#zone-upload').on('click', () => $('#file-input').trigger('click'));
+        $('#file-input').on('click', (e) => e.stopPropagation());
+        $('#file-input').on('change', (e) => processFiles(e.target.files));
+        
+        // Drag & Drop Visuals
+        const dropZone = document.getElementById('zone-upload');
+        dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.backgroundColor = 'rgba(74, 144, 226, 0.1)'; });
+        dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); dropZone.style.backgroundColor = ''; });
+        dropZone.addEventListener('drop', (e) => { e.preventDefault(); dropZone.style.backgroundColor = ''; processFiles(e.dataTransfer.files); });
+
+        // Action Buttons
+        $('#btn-do-export').click(exportIndex);
+        $('#btn-do-import').click(importIndex);
+        $('#btn-close-viewer').click(closeViewer);
+        $('#btn-copy-fulltext').click(copyViewerText);
+        $('#btn-delete-file').click(deleteCurrentFile); 
+
+        // Viewer Buttons (Delegated events for dynamically created elements)
+        $('#results').on('click', '.btn-show-full', function() { showInViewer($(this).data('title'), $(this).data('chunk-id')); });
+        $('#results').on('click', '.btn-delete-chunk', function() { deleteChunk($(this).data('title'), $(this).data('chunk-id'), $(this).closest('.result-item')); });
+
+        // --- LOGIC: RESET ---
+        // Wipes the database and memory
+        async function resetIndex() {
+            if(!confirm("Are you sure you want to REMOVE the current index?\nThis will delete all indexed data from the database.")) return;
+            showStatus("Resetting Index...");
+            // Re-create DB
+            db = await create({ schema: { id: 'string', title: 'string', chunkId: 'string', embedding: 'vector[384]' } });
+            fullTextsStore = {};
+            currentIndexName = "Local Doc Search";
+            await idb.clear(); 
+            $('#app-title').text(currentIndexName);
+            $('#results').empty();
+            closeViewer();
+            showStatus("Index Removed. Ready for new docs.", 2000);
+        }
+
+        // --- LOGIC: INGESTION & PROCESSING ---
+        async function processFiles(files) {
+            if(!files || !files.length) return;
+            let totalChunks = 0;
+            const fileCount = files.length;
+            const ALLOWED_MIMES = [
+                'text/plain', 
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            ];
+
+            for (let fIndex = 0; fIndex < fileCount; fIndex++) {
+                const file = files[fIndex];
+                const filename = file.name.replace(/\.[^/.]+$/, ""); // Remove extension
+                let rawText = "";
+
+                // 1. Validation
+                const isTxt = file.name.endsWith('.txt'); 
+                if (!ALLOWED_MIMES.includes(file.type) && !isTxt) {
+                     $('#upload-log').append(`<div style="color:var(--danger)">${file.name}: Invalid file type.</div>`);
+                     continue;
+                }
+
+                showStatus(`Processing ${fIndex + 1}/${fileCount}: ${file.name}...`);
+                await sleep(50); // Yield to UI
+
+                // 2. Overwrite Logic: If file exists, delete old chunks first
+                if(fullTextsStore[filename]) {
+                    showStatus(`Overwriting existing "${filename}"...`);
+                    const oldChunks = fullTextsStore[filename].chunks;
+                    const idsToRemove = Object.values(oldChunks).map(c => c.docId);
+                    for(const oldId of idsToRemove) {
+                        try { await remove(db, oldId); } catch(e) {}
+                    }
+                    delete fullTextsStore[filename];
+                }
+
+                try {
+                    // 3. Text Extraction
+                    if (file.name.endsWith('.docx')) {
+                        const arrayBuffer = await readFileAsArrayBuffer(file);
+                        const result = await mammoth.extractRawText({ arrayBuffer });
+                        rawText = result.value;
+                    } else {
+                        rawText = await file.text();
+                    }
+
+                    // 4. Chunking & Tagging
+                    const chunks = chunkText(rawText, 300); // 300 words per chunk
+                    let taggedFullText = ""; // We rebuild the full text with hidden tags
+                    const chunkMap = {};
+                    const docsToInsert = [];
+                    
+                    for (let i = 0; i < chunks.length; i++) {
+                        // Update UI every 5 chunks to prevent freeze
+                        if (i % 5 === 0) {
+                            showStatus(`Embedding ${filename}: ${i+1}/${chunks.length}`);
+                            await sleep(0); 
+                        }
+
+                        const chunkContent = chunks[i];
+                        const chunkId = `c_${Date.now()}_${i}`; // Generate unique ID for this chunk
+                        
+                        try {
+                            // Generate Embedding
+                            const output = await extractor(chunkContent, { pooling: 'mean', normalize: true });
+                            const oramaId = crypto.randomUUID();
+
+                            // Store Metadata in Memory
+                            chunkMap[chunkId] = { 
+                                docId: oramaId,
+                                text: chunkContent 
+                            };
+
+                            // Prepare for Vector DB Insert
+                            docsToInsert.push({ 
+                                id: oramaId, 
+                                title: filename, 
+                                chunkId: chunkId, 
+                                embedding: Array.from(output.data) 
+                            });
+
+                            // Append to tagged text. 
+                            // The tags :::START:ID::: allow us to convert this back to HTML IDs later for scrolling.
+                            taggedFullText += `:::START:${chunkId}:::${chunkContent}:::END:::\n\n`;
+
+                        } catch (err) {
+                            console.error(`Error embedding chunk ${i} of ${filename}:`, err);
+                            $('#upload-log').append(`<div style="color:var(--danger)">${filename}: Chunk ${i} failed.</div>`);
+                            taggedFullText += `${chunkContent}\n\n`; // Keep text, but don't index
+                        }
+                    }
+
+                    // Store Result
+                    fullTextsStore[filename] = { full: taggedFullText, chunks: chunkMap };
+                    
+                    // Batch Insert into Orama
+                    if(docsToInsert.length > 0) {
+                        await insertMultiple(db, docsToInsert);
+                        totalChunks += docsToInsert.length;
+                        $('#upload-log').append(`<div><i class="fas fa-check"></i> ${filename}: ${docsToInsert.length} chunks.</div>`);
+                    } else {
+                        $('#upload-log').append(`<div style="color:var(--danger)">${filename}: No valid chunks created.</div>`);
+                    }
+
+                    // Auto-scroll log
+                    const logDiv = document.getElementById('upload-log'); 
+                    logDiv.scrollTop = logDiv.scrollHeight;
+
+                } catch (err) { 
+                    console.error(err); 
+                    $('#upload-log').append(`<div style="color:var(--danger)">${filename}: File parsing failed.</div>`); 
+                }
+            }
+            
+            showStatus("Saving to Database...", 0);
+            await sleep(50);
+            await saveToDatabase();
+            showStatus(`Completed! Indexed ${totalChunks} chunks.`, 3000);
+            $('#file-input').val('');
+        }
+
+        // --- LOGIC: SEARCH ---
+        async function performSearch() {
+            const query = $('#search-input').val();
+            if(!query) return;
+            showStatus("Searching...");
+            $('#results').empty();
+            closeViewer();
+
+            try {
+                // 1. Vectorize the user query
+                const output = await extractor(query, { pooling: 'mean', normalize: true });
+                
+                // 2. Perform Vector Search in Orama
+                const searchResult = await search(db, {
+                    mode: 'hybrid', // Combines vector similarity with keyword matching
+                    term: query,
+                    vector: { value: Array.from(output.data), property: 'embedding' },
+                    similarity: 0.1, // Threshold
+                    limit: 30
+                });
+                $('#status-bar').hide();
+
+                if (searchResult.hits.length === 0) { $('#results').html('<div style="text-align:center; color:#666; margin-top:20px;">No results found.</div>'); return; }
+
+                // 3. Render Results
+                searchResult.hits.forEach(hit => {
+                    const { title, chunkId } = hit.document;
+                    const chunkData = fullTextsStore[title]?.chunks[chunkId];
+                    if (!chunkData) return; 
+                    
+                    const previewText = chunkData.text.length > 200 ? chunkData.text.substring(0, 200) + "..." : chunkData.text;
+
+                    const html = `
+                        <div class="result-item">
+                            <div class="result-title"><i class="fas fa-file-alt"></i> ${title}</div>
+                            <div class="result-text">${previewText}</div>
+                            <div class="result-actions">
+                                <button class="btn-danger-icon btn-delete-chunk" title="Delete Chunk" data-title="${title}" data-chunk-id="${chunkId}" style="border:1px solid #e74c3c; padding: 5px 10px; border-radius: 4px;">
+                                    <i class="fas fa-trash"></i> Delete
+                                </button>
+                                <button class="btn-link btn-show-full" title="View Full Text" data-title="${title}" data-chunk-id="${chunkId}" style="padding: 5px 10px; border-radius: 4px;">
+                                    Full Text <i class="fas fa-arrow-right"></i>
+                                </button>
+                            </div>
+                        </div>`;
+                    $('#results').append(html);
+                });
+            } catch (e) {
+                console.error(e);
+                showStatus("Search Error.");
+            }
+        }
+
+        // --- LOGIC: DELETION ---
+        
+        // Deletes a single chunk (vector) from the index
+        async function deleteChunk(title, chunkId, $domElement) {
+            if(!confirm("Confirm Deletion: This chunk will be removed.")) return;
+            const chunkInfo = fullTextsStore[title]?.chunks[chunkId];
+            if(!chunkInfo) return;
+            showStatus("Deleting...");
+            
+            // Remove from Orama
+            await remove(db, chunkInfo.docId);
+            // Remove from JS memory store
+            delete fullTextsStore[title].chunks[chunkId];
+            
+            await saveToDatabase();
+            $domElement.slideUp(() => $domElement.remove());
+            showStatus("Deleted.", 2000);
+        }
+
+        // Deletes the whole file and all its chunks
+        async function deleteCurrentFile() {
+            const title = $('#viewer-title').text();
+            if(!title) return;
+            if(!confirm(`DANGER: Delete file "${title}"?\nThis removes ALL chunks.`)) return;
+            showStatus(`Deleting ${title}...`);
+            const fileData = fullTextsStore[title];
+            if(!fileData) return;
+            
+            // Remove all associated chunks from Orama
+            const chunkIds = Object.keys(fileData.chunks);
+            for(const cId of chunkIds) {
+                try { await remove(db, fileData.chunks[cId].docId); } catch(e){}
+            }
+            
+            delete fullTextsStore[title];
+            await saveToDatabase();
+            closeViewer();
+            $('#results').empty(); 
+            showStatus("File deleted.", 2000);
+        }
+
+        // --- VIEWER LOGIC (Precise Scrolling) ---
+        function showInViewer(title, chunkId) {
+            const doc = fullTextsStore[title];
+            if (!doc) return;
+
+            let rawContent = doc.full;
+
+            // Security: Escape HTML to prevent XSS from document content
+            let safeContent = escapeHtml(rawContent);
+
+            // Transform Tags to HTML:
+            // Replace :::START:xyz::: with <span id="xyz">
+            safeContent = safeContent.replace(/:::START:(.*?):::/g, '<span id="$1" class="searchable-chunk">');
+            safeContent = safeContent.replace(/:::END:::/g, '</span>');
+
+            $('#viewer-title').text(title);
+            $('#viewer-content').html(safeContent);
+            $('#viewer-pane').addClass('visible').fadeIn();
+            $('#main-content').css('width', '50%');
+
+            // Scroll to the specific chunk ID
+            setTimeout(() => { 
+                $('.searchable-chunk').removeClass('active-highlight');
+                const target = document.getElementById(chunkId);
+                if(target) {
+                    $(target).addClass('active-highlight');
+                    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }, 100);
+        }
+
+        function closeViewer() { $('#viewer-pane').removeClass('visible').fadeOut(); $('#main-content').css('width', '100%'); }
+        
+        async function copyViewerText() {
+            const title = $('#viewer-title').text();
+            let text = fullTextsStore[title]?.full;
+            if(text) { 
+                // Strip the custom tags before copying to clipboard
+                text = text.replace(/:::START:.*?:::/g, "").replace(/:::END:::/g, "");
+                await navigator.clipboard.writeText(text); 
+                showStatus("Copied clean text!", 1500); 
+            }
+        }
+
+        // --- PERSISTENCE (SAVE/LOAD STATE) ---
+        async function saveToDatabase() {
+            // Snapshot the vector DB
+            const indexSnapshot = await save(db);
+            // Bundle vectors + full text + metadata
+            const data = { orama: indexSnapshot, store: fullTextsStore, name: currentIndexName, timestamp: Date.now() };
+            try { await idb.put('state', data); } 
+            catch (e) { console.error(e); alert("Database Error: " + e.message); }
+        }
+        
+        async function loadFromDatabase() {
+            const data = await idb.get('state');
+            if(data && data.orama && data.store) {
+                // Restore Orama instance
+                db = await create({ schema: { id:'string', title:'string', chunkId:'string', embedding:'vector[384]' } });
+                await load(db, data.orama);
+                // Restore full text store
+                fullTextsStore = data.store;
+                if(data.name) currentIndexName = data.name;
+            }
+        }
+
+        // --- EXPORT LOGIC (ENCRYPTION) ---
+        async function exportIndex() {
+            const nameInput = $('#export-name').val();
+            const filename = nameInput || "search-index";
+            const password = $('#export-pass').val();
+
+            if(!password && !confirm("No password set. Export unencrypted?")) return;
+
+            if(nameInput) {
+                currentIndexName = nameInput;
+                $('#app-title').text(currentIndexName);
+                await saveToDatabase();
+            }
+
+            showStatus("Exporting...");
+            const indexSnapshot = await save(db);
+            const exportObj = { orama: indexSnapshot, store: fullTextsStore, name: currentIndexName };
+            const jsonStr = JSON.stringify(exportObj);
+
+            let finalBlob;
+            
+            // AES-GCM Encryption
+            if (password) {
+                showStatus("Encrypting...");
+                const salt = window.crypto.getRandomValues(new Uint8Array(16));
+                const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                const passwordKey = await getPasswordKey(password);
+                const aesKey = await deriveKey(passwordKey, salt, ["encrypt"]);
+                const encryptedContent = await window.crypto.subtle.encrypt(
+                    { name: "AES-GCM", iv: iv }, aesKey, new TextEncoder().encode(jsonStr)
+                );
+
+                // Combine Salt + IV + Data into one buffer
+                const combinedBuffer = new Uint8Array(salt.byteLength + iv.byteLength + encryptedContent.byteLength);
+                combinedBuffer.set(salt, 0); combinedBuffer.set(iv, 16); combinedBuffer.set(new Uint8Array(encryptedContent), 28);
+
+                const base64Data = await blobToBase64(new Blob([combinedBuffer]));
+                finalBlob = new Blob([JSON.stringify({ data: base64Data.split(',')[1], encrypted: true })], { type: "application/json" });
+            } else {
+                finalBlob = new Blob([JSON.stringify({ data: jsonStr, encrypted: false })], { type: "application/json" });
+            }
+
+            // Trigger Download
+            const url = URL.createObjectURL(finalBlob);
+            const a = document.createElement('a');
+            a.href = url; a.download = `${filename}.json`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showStatus("Exported!", 2000);
+            togglePanel('#panel-export');
+        }
+
+        // --- IMPORT LOGIC (DECRYPTION) ---
+        async function importIndex() {
+            const file = document.getElementById('import-file').files[0];
+            const password = $('#import-pass').val();
+            if(!file) return alert("Select a file.");
+
+            showStatus("Importing...");
+            const text = await file.text();
+            
+            try {
+                const wrapper = JSON.parse(text);
+                let contentStr = wrapper.data;
+
+                if(wrapper.encrypted) {
+                    if(!password) { showStatus("Password required.", 3000); return; }
+                    try { 
+                        showStatus("Decrypting...");
+                        // Decode Base64
+                        const binaryString = atob(wrapper.data);
+                        const len = binaryString.length;
+                        const buffer = new Uint8Array(len);
+                        for (let i = 0; i < len; i++) buffer[i] = binaryString.charCodeAt(i);
+
+                        // Extract Salt, IV, and Data
+                        const salt = buffer.slice(0, 16);
+                        const iv = buffer.slice(16, 28);
+                        const data = buffer.slice(28);
+
+                        // Decrypt
+                        const passwordKey = await getPasswordKey(password);
+                        const aesKey = await deriveKey(passwordKey, salt, ["decrypt"]);
+                        const decryptedContent = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, aesKey, data);
+                        contentStr = new TextDecoder().decode(decryptedContent);
+                    } 
+                    catch(e) { console.error(e); alert("Wrong password or corrupted file."); showStatus("Error", 2000); return; }
+                }
+
+                const importedData = JSON.parse(contentStr);
+                // Rebuild DB from import
+                db = await create({ schema: { id:'string', title:'string', chunkId:'string', embedding:'vector[384]' } });
+                await load(db, importedData.orama);
+                fullTextsStore = importedData.store;
+                currentIndexName = importedData.name || file.name.replace('.json', '');
+                $('#app-title').text(currentIndexName);
+
+                await saveToDatabase();
+                showStatus(`Imported "${currentIndexName}"`, 3000);
+                togglePanel('#panel-import');
+                $('#results').empty();
+            } catch (e) { console.error(e); alert("Invalid File."); showStatus("Error", 2000); }
+        }
+
+        // --- HELPER UTILITIES ---
+        
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        
+        function blobToBase64(blob) {
+            return new Promise((resolve, _) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.readAsDataURL(blob);
+            });
+        }
+        
+        // Simple word-count based chunker. Could be improved with sentence boundaries.
+        function chunkText(text, maxWords) {
+            const paragraphs = text.split(/\n\s*\n/); const chunks = [];
+            let currentChunk = []; let currentWordCount = 0;
+            for (const para of paragraphs) {
+                const cleanPara = para.trim(); if(!cleanPara) continue;
+                const wordCount = cleanPara.split(/\s+/).length;
+                if (currentWordCount + wordCount > maxWords && currentChunk.length > 0) {
+                    chunks.push(currentChunk.join("\n\n")); currentChunk = []; currentWordCount = 0;
+                }
+                currentChunk.push(cleanPara); currentWordCount += wordCount;
+            }
+            if (currentChunk.length > 0) chunks.push(currentChunk.join("\n\n"));
+            return chunks;
+        }
+        
+        function readFileAsArrayBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+        
+        function escapeHtml(text) {
+            if (!text) return text;
+            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
+        
+        function showStatus(msg, autoHideMs = 0) {
+            $('#status-text').text(msg); $('#status-bar').fadeIn();
+            if(autoHideMs > 0) setTimeout(() => $('#status-bar').fadeOut(), autoHideMs);
+        }
+        
+        // --- CRYPTO HELPERS ---
+        async function getPasswordKey(password) {
+            const enc = new TextEncoder();
+            return window.crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+        }
+        async function deriveKey(passwordKey, salt, usage) {
+            return window.crypto.subtle.deriveKey(
+                { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+                passwordKey, { name: "AES-GCM", length: 256 }, false, usage
+            );
+        }
+    </script>
+</body>
+</html>
