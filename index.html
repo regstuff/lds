@@ -634,49 +634,77 @@
             const filename = nameInput || "search-index";
             const password = $('#export-pass').val();
 
-            if(!password && !confirm("No password set. Export unencrypted?")) return;
+            if (!password && !confirm("No password set. Export unencrypted?")) return;
 
-            if(nameInput) {
+            if (nameInput) {
                 currentIndexName = nameInput;
                 $('#app-title').text(currentIndexName);
                 await saveToDatabase();
             }
 
-            showStatus("Exporting...");
+            showStatus("Snapshotting DB...");
+            // 1. Snapshot Orama (Heavy operation)
             const indexSnapshot = await save(db);
-            const exportObj = { orama: indexSnapshot, store: fullTextsStore, name: currentIndexName };
-            const jsonStr = JSON.stringify(exportObj);
-
-            let finalBlob;
             
-            // AES-GCM Encryption
+            // 2. Prepare Metadata
+            const meta = { name: currentIndexName, timestamp: Date.now() };
+
+            showStatus("Preparing Data...");
+
+            // 3. Construct JSON using Blob Parts (Avoids creating one giant string)
+            // We manually build the JSON structure: {"orama": ..., "store": ..., "meta": ...}
+            const parts = [
+                '{"meta":', JSON.stringify(meta), 
+                ',"orama":', JSON.stringify(indexSnapshot), 
+                ',"store":', JSON.stringify(fullTextsStore), 
+                '}'
+            ];
+
+            // Create a Blob from parts (Streaming-like approach)
+            let finalBlob = new Blob(parts, { type: 'application/json' });
+            
+            // Help Garbage Collector: release the snapshot reference immediately
+            parts.length = 0; 
+
             if (password) {
-                showStatus("Encrypting...");
+                showStatus("Encrypting (this may take a moment)...");
+                
+                // Convert Blob to ArrayBuffer for encryption
+                const plaintextBuffer = await finalBlob.arrayBuffer();
+                
+                // Generate Keys
                 const salt = window.crypto.getRandomValues(new Uint8Array(16));
                 const iv = window.crypto.getRandomValues(new Uint8Array(12));
                 const passwordKey = await getPasswordKey(password);
                 const aesKey = await deriveKey(passwordKey, salt, ["encrypt"]);
+
+                // Encrypt (AES-GCM)
                 const encryptedContent = await window.crypto.subtle.encrypt(
-                    { name: "AES-GCM", iv: iv }, aesKey, new TextEncoder().encode(jsonStr)
+                    { name: "AES-GCM", iv: iv }, aesKey, plaintextBuffer
                 );
 
-                // Combine Salt + IV + Data into one buffer
+                // Combine Salt + IV + Data into one binary buffer
                 const combinedBuffer = new Uint8Array(salt.byteLength + iv.byteLength + encryptedContent.byteLength);
-                combinedBuffer.set(salt, 0); combinedBuffer.set(iv, 16); combinedBuffer.set(new Uint8Array(encryptedContent), 28);
+                combinedBuffer.set(salt, 0); 
+                combinedBuffer.set(iv, 16); 
+                combinedBuffer.set(new Uint8Array(encryptedContent), 28);
 
-                const base64Data = await blobToBase64(new Blob([combinedBuffer]));
-                finalBlob = new Blob([JSON.stringify({ data: base64Data.split(',')[1], encrypted: true })], { type: "application/json" });
-            } else {
-                finalBlob = new Blob([JSON.stringify({ data: jsonStr, encrypted: false })], { type: "application/json" });
+                // Create Binary Blob (Not JSON)
+                finalBlob = new Blob([combinedBuffer], { type: "application/octet-stream" });
             }
 
             // Trigger Download
             const url = URL.createObjectURL(finalBlob);
             const a = document.createElement('a');
-            a.href = url; a.download = `${filename}.json`;
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            a.href = url;
+            // Use .bin for encrypted to distinguish from plain JSON
+            a.download = password ? `${filename}.bin` : `${filename}.json`; 
+            document.body.appendChild(a); 
+            a.click(); 
+            document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            showStatus("Exported!", 2000);
+            
+            showStatus("Export Complete!", 2000);
             togglePanel('#panel-export');
         }
 
