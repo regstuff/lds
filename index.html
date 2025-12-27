@@ -350,12 +350,14 @@
             for (let fIndex = 0; fIndex < fileCount; fIndex++) {
                 const file = files[fIndex];
                 const filename = file.name.replace(/\.[^/.]+$/, ""); // Remove extension
+                const safeFilename = escapeHtml(filename);
                 let rawText = "";
 
                 // 1. Validation
                 const isTxt = file.name.endsWith('.txt'); 
                 if (!ALLOWED_MIMES.includes(file.type) && !isTxt) {
-                     $('#upload-log').append(`<div style="color:var(--danger)">${file.name}: Invalid file type.</div>`);
+                    const safeFilename = escapeHtml(file.name);
+                     $('#upload-log').append(`<div style="color:var(--danger)">${safeFilename}: Invalid file type.</div>`);
                      continue;
                 }
 
@@ -424,7 +426,7 @@
 
                         } catch (err) {
                             console.error(`Error embedding chunk ${i} of ${filename}:`, err);
-                            $('#upload-log').append(`<div style="color:var(--danger)">${filename}: Chunk ${i} failed.</div>`);
+                            $('#upload-log').append(`<div style="color:var(--danger)">${safeFilename}: Chunk ${i} failed.</div>`);
                             taggedFullText += `${chunkContent}\n\n`; // Keep text, but don't index
                         }
                     }
@@ -436,9 +438,9 @@
                     if(docsToInsert.length > 0) {
                         await insertMultiple(db, docsToInsert);
                         totalChunks += docsToInsert.length;
-                        $('#upload-log').append(`<div><i class="fas fa-check"></i> ${filename}: ${docsToInsert.length} chunks.</div>`);
+                        $('#upload-log').append(`<div><i class="fas fa-check"></i> ${safeFilename}: ${docsToInsert.length} chunks.</div>`);
                     } else {
-                        $('#upload-log').append(`<div style="color:var(--danger)">${filename}: No valid chunks created.</div>`);
+                        $('#upload-log').append(`<div style="color:var(--danger)">${safeFilename}: No valid chunks created.</div>`);
                     }
 
                     // Auto-scroll log
@@ -447,7 +449,7 @@
 
                 } catch (err) { 
                     console.error(err); 
-                    $('#upload-log').append(`<div style="color:var(--danger)">${filename}: File parsing failed.</div>`); 
+                    $('#upload-log').append(`<div style="color:var(--danger)">${safeFilename}: File parsing failed.</div>`); 
                 }
             }
             
@@ -483,22 +485,30 @@
                 if (searchResult.hits.length === 0) { $('#results').html('<div style="text-align:center; color:#666; margin-top:20px;">No results found.</div>'); return; }
 
                 // 3. Render Results
+                // ... inside performSearch loop ...
                 searchResult.hits.forEach(hit => {
                     const { title, chunkId } = hit.document;
                     const chunkData = fullTextsStore[title]?.chunks[chunkId];
                     if (!chunkData) return; 
+
+                    // SECURITY FIX: Escape the raw text before putting it in HTML
+                    let previewText = chunkData.text.length > 200 ? chunkData.text.substring(0, 200) + "..." : chunkData.text;
                     
-                    const previewText = chunkData.text.length > 200 ? chunkData.text.substring(0, 200) + "..." : chunkData.text;
+                    // Apply escaping
+                    const safeTitle = escapeHtml(title);
+                    const safePreview = escapeHtml(previewText);
 
                     const html = `
                         <div class="result-item">
-                            <div class="result-title"><i class="fas fa-file-alt"></i> ${title}</div>
-                            <div class="result-text">${previewText}</div>
+                            <!-- Use safeTitle and safePreview -->
+                            <div class="result-title"><i class="fas fa-file-alt"></i> ${safeTitle}</div>
+                            <div class="result-text">${safePreview}</div>
                             <div class="result-actions">
-                                <button class="btn-danger-icon btn-delete-chunk" title="Delete Chunk" data-title="${title}" data-chunk-id="${chunkId}" style="border:1px solid #e74c3c; padding: 5px 10px; border-radius: 4px;">
+                                <!-- Ensure data attributes use safeTitle as well, though less critical for XSS, good for breaking layout -->
+                                <button class="btn-danger-icon btn-delete-chunk" title="Delete Chunk" data-title="${safeTitle}" data-chunk-id="${chunkId}" style="border:1px solid #e74c3c; padding: 5px 10px; border-radius: 4px;">
                                     <i class="fas fa-trash"></i> Delete
                                 </button>
-                                <button class="btn-link btn-show-full" title="View Full Text" data-title="${title}" data-chunk-id="${chunkId}" style="padding: 5px 10px; border-radius: 4px;">
+                                <button class="btn-link btn-show-full" title="View Full Text" data-title="${safeTitle}" data-chunk-id="${chunkId}" style="padding: 5px 10px; border-radius: 4px;">
                                     Full Text <i class="fas fa-arrow-right"></i>
                                 </button>
                             </div>
@@ -674,52 +684,91 @@
         async function importIndex() {
             const file = document.getElementById('import-file').files[0];
             const password = $('#import-pass').val();
-            if(!file) return alert("Select a file.");
+            if (!file) return alert("Select a file.");
 
-            showStatus("Importing...");
-            const text = await file.text();
+            showStatus("Reading file...");
             
             try {
-                const wrapper = JSON.parse(text);
-                let contentStr = wrapper.data;
+                let importedData;
+                let isBinary = false;
 
-                if(wrapper.encrypted) {
-                    if(!password) { showStatus("Password required.", 3000); return; }
-                    try { 
-                        showStatus("Decrypting...");
-                        // Decode Base64
-                        const binaryString = atob(wrapper.data);
-                        const len = binaryString.length;
-                        const buffer = new Uint8Array(len);
-                        for (let i = 0; i < len; i++) buffer[i] = binaryString.charCodeAt(i);
-
-                        // Extract Salt, IV, and Data
-                        const salt = buffer.slice(0, 16);
-                        const iv = buffer.slice(16, 28);
-                        const data = buffer.slice(28);
-
-                        // Decrypt
-                        const passwordKey = await getPasswordKey(password);
-                        const aesKey = await deriveKey(passwordKey, salt, ["decrypt"]);
-                        const decryptedContent = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, aesKey, data);
-                        contentStr = new TextDecoder().decode(decryptedContent);
-                    } 
-                    catch(e) { console.error(e); alert("Wrong password or corrupted file."); showStatus("Error", 2000); return; }
+                // Attempt to parse as JSON first (Unencrypted or Legacy JSON-Encrypted)
+                try {
+                    const text = await file.text();
+                    importedData = JSON.parse(text);
+                } catch (e) {
+                    // If JSON parse fails, it's likely our new Binary Encrypted format
+                    isBinary = true;
                 }
 
-                const importedData = JSON.parse(contentStr);
-                // Rebuild DB from import
+                // --- DECRYPTION PATH ---
+                if (isBinary || (importedData && importedData.encrypted)) {
+                    if (!password) { showStatus("Password required.", 3000); return; }
+                    showStatus("Decrypting...");
+
+                    let buffer;
+
+                    if (isBinary) {
+                        // NEW FORMAT: Read file directly as ArrayBuffer
+                        buffer = await file.arrayBuffer();
+                        buffer = new Uint8Array(buffer);
+                    } else {
+                        // LEGACY FORMAT: Base64 decode (High memory usage, but kept for backward compatibility)
+                        const binaryString = atob(importedData.data);
+                        const len = binaryString.length;
+                        buffer = new Uint8Array(len);
+                        for (let i = 0; i < len; i++) buffer[i] = binaryString.charCodeAt(i);
+                    }
+
+                    // Extract Salt (16 bytes), IV (12 bytes), Data (Rest)
+                    const salt = buffer.slice(0, 16);
+                    const iv = buffer.slice(16, 28);
+                    const data = buffer.slice(28);
+
+                    try {
+                        const passwordKey = await getPasswordKey(password);
+                        const aesKey = await deriveKey(passwordKey, salt, ["decrypt"]);
+                        
+                        const decryptedBuffer = await window.crypto.subtle.decrypt(
+                            { name: "AES-GCM", iv: iv }, aesKey, data
+                        );
+
+                        // Convert decrypted buffer back to JSON string, then Object
+                        const dec = new TextDecoder();
+                        importedData = JSON.parse(dec.decode(decryptedBuffer));
+                    } catch (err) {
+                        console.error(err);
+                        alert("Decryption failed. Wrong password?");
+                        showStatus("Error", 2000);
+                        return;
+                    }
+                }
+
+                // --- RESTORE PATH ---
+                showStatus("Rebuilding Database...");
+                
+                // 1. Restore Orama
                 db = await create({ schema: { id:'string', title:'string', chunkId:'string', embedding:'vector[384]' } });
                 await load(db, importedData.orama);
+                
+                // 2. Restore Store & Metadata
                 fullTextsStore = importedData.store;
-                currentIndexName = importedData.name || file.name.replace('.json', '');
+                currentIndexName = importedData.meta?.name || importedData.name || file.name.replace(/\.(json|bin)$/, '');
+                
                 $('#app-title').text(currentIndexName);
 
+                // 3. Persist
                 await saveToDatabase();
+                
                 showStatus(`Imported "${currentIndexName}"`, 3000);
                 togglePanel('#panel-import');
                 $('#results').empty();
-            } catch (e) { console.error(e); alert("Invalid File."); showStatus("Error", 2000); }
+
+            } catch (e) {
+                console.error(e);
+                alert("Import Failed: " + e.message);
+                showStatus("Error", 2000);
+            }
         }
 
         // --- HELPER UTILITIES ---
